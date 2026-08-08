@@ -388,6 +388,28 @@ pub struct EventLoop {
     // by the event loop instead of the file store so that FileStore
     // can remain Send
     queued_disk_operations: Vec<DiskOp>,
+    /// Peers blocked for the rest of the session. Checked before dialling out
+    /// and on accepting an inbound connection, so a blocked peer cannot simply
+    /// be rediscovered and reconnected — which the DHT will otherwise do within
+    /// seconds.
+    ///
+    /// Session-scoped on purpose, and not persisted across restarts. The
+    /// attribution here is inherently approximate: a piece is assembled from
+    /// subpieces that may come from several peers, so a run of bad luck can
+    /// blame a peer that did nothing wrong. A wrong entry that survives
+    /// restarts is worse than the thing it defends against — a peer wasting
+    /// our bandwidth is also paying for its own, whereas a peer we have
+    /// permanently and mistakenly shunned is a good peer lost for good, on
+    /// evidence nobody can see or revisit. Forgetting on restart bounds the
+    /// cost of being wrong to a single session.
+    ///
+    /// Worth revisiting only once this has run long enough in the wild to show
+    /// how often it misfires.
+    blocklist: HashSet<SockAddr>,
+    /// Scratch space for connections reported by
+    /// `queue_disk_write_for_downloaded_pieces`; reused to avoid allocating on
+    /// every tick.
+    hash_failures: Vec<ConnectionId>,
     our_id: PeerId,
 }
 
@@ -412,6 +434,8 @@ impl<'scope, 'state: 'scope> EventLoop {
             inflight_disk_ops: 0,
             state: EventLoopState::Paused { listener_fd: None },
             queued_disk_operations: Vec::with_capacity(32),
+            blocklist: HashSet::new(),
+            hash_failures: Vec::new(),
         }
     }
 
@@ -546,6 +570,9 @@ impl<'scope, 'state: 'scope> EventLoop {
                     for connection in self.connections.values_mut() {
                         if let Some(reason) = &connection.pending_disconnect {
                             log::warn!("Disconnect: {} reason {reason}", connection.peer_id,);
+                            if reason.warrants_blocklisting() {
+                                self.blocklist.insert(connection.peer_addr.into());
+                            }
                             #[cfg(feature = "metrics")]
                             {
                                 let counter = metrics::counter!("disconnects");
@@ -601,8 +628,28 @@ impl<'scope, 'state: 'scope> EventLoop {
                 }
 
                 if let Some(torrent_state) = state_ref.state() {
-                    torrent_state
-                        .queue_disk_write_for_downloaded_pieces(&mut self.queued_disk_operations);
+                    torrent_state.queue_disk_write_for_downloaded_pieces(
+                        &mut self.queued_disk_operations,
+                        &mut self.hash_failures,
+                    );
+                    let failure_limit = state_ref.config.max_piece_hash_failures;
+                    for conn_id in self.hash_failures.drain(..) {
+                        let Some(connection) = self.connections.get_mut(conn_id) else {
+                            continue;
+                        };
+                        connection.hash_failures += 1;
+                        if failure_limit > 0
+                            && connection.hash_failures >= failure_limit
+                            && connection.pending_disconnect.is_none()
+                        {
+                            log::warn!(
+                                "Peer {} supplied {} pieces failing their hash check; blocking",
+                                connection.peer_addr,
+                                connection.hash_failures
+                            );
+                            connection.pending_disconnect = Some(DisconnectReason::CorruptPieces);
+                        }
+                    }
                     for disk_op in self.queued_disk_operations.drain(..) {
                         io_utils::disk_operation(
                             &mut self.events,
@@ -756,6 +803,13 @@ impl<'scope, 'state: 'scope> EventLoop {
                         if self.pending_connections.contains(&addr)
                             || existing_connections.contains(&addr)
                         {
+                            continue;
+                        }
+                        // Peer discovery will keep offering a blocked peer —
+                        // the DHT rediscovers it within seconds — so the check
+                        // has to be here rather than only at disconnect time.
+                        if self.blocklist.contains(&addr) {
+                            log::debug!("Skipping blocked peer {addr:?}");
                             continue;
                         }
                         if self.pending_connections.len() + self.connections.len()
@@ -932,6 +986,12 @@ impl<'scope, 'state: 'scope> EventLoop {
                     io_utils::close_socket(sq, socket, None, &mut self.events);
                     return Ok(());
                 };
+                // A blocked peer will happily dial us instead.
+                if self.blocklist.contains(&addr) {
+                    log::debug!("Rejecting connection from blocked peer {addr:?}");
+                    io_utils::close_socket(sq, socket, None, &mut self.events);
+                    return Ok(());
+                }
 
                 log::info!(
                     "Accepted connection: {:?}",

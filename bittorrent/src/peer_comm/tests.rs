@@ -74,7 +74,9 @@ fn simulate_disk_write_completion(
     expected_pieces: &[i32],
 ) {
     // Queue disk writes for downloaded pieces
-    torrent_state.queue_disk_write_for_downloaded_pieces(pending_disk_operations);
+    let mut hash_failures = Vec::new();
+    torrent_state
+        .queue_disk_write_for_downloaded_pieces(pending_disk_operations, &mut hash_failures);
 
     // Verify the correct pieces were queued
     let mut queued_pieces: Vec<i32> = pending_disk_operations

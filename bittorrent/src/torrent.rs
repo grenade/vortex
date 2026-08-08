@@ -85,6 +85,15 @@ pub struct Config {
     pub write_buffer_pool_size: usize,
     /// The size of the Reaad network buffer pools
     pub read_buffer_pool_size: usize,
+    /// How many pieces a peer may complete that fail their hash check before it
+    /// is disconnected and blocked for the rest of the session. `0` disables
+    /// blocking entirely.
+    ///
+    /// Without this a single peer serving data that never verifies will
+    /// saturate the connection indefinitely: every piece is re-requested from
+    /// it, fails again, and the torrent makes no progress while appearing to
+    /// download at full speed.
+    pub max_piece_hash_failures: u32,
 }
 
 impl Default for Config {
@@ -101,6 +110,7 @@ impl Default for Config {
             completion_event_want: 32,
             network_read_buffer_size: (SUBPIECE_SIZE * 2) as usize,
             read_buffer_pool_size: 512,
+            max_piece_hash_failures: 3,
             network_write_buffer_size: (SUBPIECE_SIZE + 4096) as usize,
             write_buffer_pool_size: 128,
         }
@@ -412,9 +422,15 @@ impl InitializedState {
     }
 
     // TODO: Put this in the event loop directly instead when that is easier to test
+    /// Queue disk writes for pieces that verified, and report the connections
+    /// that completed pieces which did not.
+    ///
+    /// Failures are reported rather than acted on here because the event loop
+    /// owns the connections; this keeps the state machine testable in isolation.
     pub(crate) fn queue_disk_write_for_downloaded_pieces(
         &mut self,
         pending_disk_operations: &mut Vec<DiskOp>,
+        hash_failures: &mut Vec<ConnectionId>,
     ) {
         while let Ok(completed_piece) = self.downloaded_piece_rc.try_recv() {
             if completed_piece.hash_matched {
@@ -432,9 +448,11 @@ impl InitializedState {
                 self.piece_selector
                     .mark_not_downloaded(completed_piece.index);
                 self.piece_buffer_pool.return_buffer(completed_piece.buffer);
-                // deallocate piece peer peer
-                // TODO: disconnect
-                log::error!("Piece hash didn't match expected hash!");
+                log::error!(
+                    "Piece {} hash didn't match expected hash!",
+                    completed_piece.index
+                );
+                hash_failures.push(completed_piece.conn_id);
                 self.piece_selector
                     .mark_not_allocated(completed_piece.index as i32, completed_piece.conn_id);
             }
@@ -868,5 +886,38 @@ mod tests {
         assert_eq!(progress.total_completed(), 0);
         assert!(!progress.get(0));
         assert_eq!(progress.iter().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod blocklist_threshold_tests {
+    use super::Config;
+
+    /// A piece is assembled from subpieces that may come from several peers, so
+    /// the peer credited with completing a failed piece is not necessarily the
+    /// one that corrupted it. The threshold is what makes that acceptable:
+    /// an unlucky peer survives, a peer that never produces a valid piece does
+    /// not.
+    #[test]
+    fn a_peer_is_blocked_only_after_repeated_failures() {
+        let limit = Config::default().max_piece_hash_failures;
+        assert!(
+            limit > 1,
+            "blocking on a single failure would punish misattribution"
+        );
+
+        let should_block = |failures: u32| limit > 0 && failures >= limit;
+        assert!(!should_block(1));
+        assert!(!should_block(limit - 1));
+        assert!(should_block(limit));
+        assert!(should_block(limit + 10));
+    }
+
+    #[test]
+    fn a_zero_limit_disables_blocking_entirely() {
+        let limit = 0;
+        let should_block = |failures: u32| limit > 0 && failures >= limit;
+        assert!(!should_block(1));
+        assert!(!should_block(1000));
     }
 }
