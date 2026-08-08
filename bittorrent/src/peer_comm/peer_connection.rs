@@ -131,6 +131,27 @@ pub enum DisconnectReason {
     /// The example of this is that both peers are upload only
     #[error("Connection is no longer meaningful for any peer")]
     RedundantConnection,
+    /// The peer supplied enough pieces that failed their hash check to be
+    /// treated as broken or hostile rather than unlucky.
+    #[error("Too many pieces failed their hash check")]
+    CorruptPieces,
+}
+
+impl DisconnectReason {
+    /// Whether a disconnect for this reason should also block the peer for the
+    /// rest of the session.
+    ///
+    /// Deliberately narrow. `Idle` and `RedundantConnection` are ordinary
+    /// housekeeping, and `ProtocolError` currently covers benign cases too — a
+    /// peer omitting the `m` dictionary from its extended handshake is useless
+    /// for metadata but may still serve pieces perfectly well. Only misbehaviour
+    /// that wastes our bandwidth or cannot be trusted earns a block.
+    pub fn warrants_blocklisting(&self) -> bool {
+        matches!(
+            self,
+            DisconnectReason::CorruptPieces | DisconnectReason::InvalidMessage
+        )
+    }
 }
 
 pub enum ConnectionState {
@@ -190,6 +211,12 @@ pub struct PeerConnection {
     pub extended_extension: bool,
     /// Progress for downloading metadata if supported
     pub metadata_progress: Option<MetadataProgress>,
+    /// How many pieces completed by this peer have failed their hash check.
+    ///
+    /// A piece is assembled from subpieces that may come from several peers, so
+    /// this attributes to whoever completed it rather than to whoever corrupted
+    /// it. That is why it is a count with a threshold and not a single strike.
+    pub hash_failures: u32,
     /// The peer have informed us that it is choking us.
     pub peer_choking: bool,
     /// The peer is interested what we have to offer
@@ -273,6 +300,7 @@ impl<'scope, 'f_store: 'scope> PeerConnection {
             is_choking: true,
             is_interesting: false,
             sent_allowed_fast: false,
+            hash_failures: 0,
             peer_choking: true,
             peer_interested: false,
             endgame: false,
@@ -1279,5 +1307,31 @@ impl<'scope, 'f_store: 'scope> PeerConnection {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod blocklist_tests {
+    use super::DisconnectReason;
+
+    #[test]
+    fn only_misbehaviour_earns_a_block() {
+        // Wasting our bandwidth or sending something unparseable.
+        assert!(DisconnectReason::CorruptPieces.warrants_blocklisting());
+        assert!(DisconnectReason::InvalidMessage.warrants_blocklisting());
+
+        // Ordinary housekeeping. Blocking on these would evict peers that have
+        // done nothing wrong, and a seed we are no longer interested in is a
+        // peer we may well want again on the next torrent.
+        assert!(!DisconnectReason::Idle.warrants_blocklisting());
+        assert!(!DisconnectReason::RedundantConnection.warrants_blocklisting());
+
+        // Deliberately excluded: this currently covers benign cases, such as a
+        // peer omitting the `m` dictionary from its extended handshake, which
+        // makes it useless for metadata but fine for pieces.
+        assert!(
+            !DisconnectReason::ProtocolError("Missing m member of metadata")
+                .warrants_blocklisting()
+        );
     }
 }
